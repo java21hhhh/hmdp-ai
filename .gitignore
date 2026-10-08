@@ -1,0 +1,35 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+### 编译产物 ###
+*.class
+*.jar
+*.war
+
+### IDE ###
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+### 日志 ###
+*.log
+logs/
+
+### 系统 ###
+.DS_Store
+Thumbs.db
+
+### ★★★ 密钥相关 —— 这几个绝不能提交 ★★★ ###
+# 启动.bat 里写了真实的 DEEPSEEK_API_KEY,提交上去等于把 key 送给全世界。
+# (上次 sky-take-out 的阿里云 AccessKey 就是这么公开了三个月的,别再犯。)
+启动.bat
+run-local.bat
+*.local.yml
+application-local.yml
+application-local.yaml
+.env
