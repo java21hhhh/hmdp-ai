@@ -2,14 +2,19 @@ package com.hxr.hmdpai.service;
 
 import com.hxr.hmdpai.client.HmdpClient;
 import com.hxr.hmdpai.tool.HmdpTools;
+import com.hxr.hmdpai.usage.RoundUsageRecorder;
+import com.hxr.hmdpai.usage.TokenUsage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
-import org.springframework.ai.chat.memory.InMemoryChatMemoryRepository;
+import org.springframework.ai.chat.memory.ChatMemoryRepository;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.chat.metadata.Usage;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
 
 import java.util.List;
 
@@ -81,6 +86,7 @@ public class AiAgentService {
      * </ol>
      */
     private static final String SYSTEM_PROMPT = """
+            
             你是一个本地生活推荐助手，可以调用工具查询真实的店铺和优惠券数据。
 
             工作方式：
@@ -92,6 +98,7 @@ public class AiAgentService {
             3. 如果一次查询的结果不理想（比如搜到的店铺都不满意，或者没有优惠券），
                换个思路再试试 —— 换个关键词，或者从已有结果里找别的线索接着查。不要直接放弃。
             4. 用自然、口语化的中文回答，200 字以内，不要说套话。
+            5.决定调用工具时，直接调用，不要在调用前输出任何解说文字（比如"我先搜索一下…"、"让我查查…"）
             """;
 
     private final HmdpClient hmdpClient;
@@ -102,8 +109,12 @@ public class AiAgentService {
      *
      * <p>手写版要自己管的 4 件事，现在分别归谁管：
      * <ul>
-     *   <li>存在哪     → {@link ChatMemoryRepository}（现在是 {@link InMemoryChatMemoryRepository}，
-     *                   所以重启就没了；以后想活过重启，换这一行的实现类即可）</li>
+     *   <li>存在哪     → {@link ChatMemoryRepository}。★ 2026-10-09 起是<b>数据库版</b>
+     *                   （H2 文件库，见 application.yml），<b>重启不再丢记忆</b>。
+     *                   以前这里是 {@code new InMemoryChatMemoryRepository()}，
+     *                   现在改成从构造器注入 ——
+     *                   换存储方式只要换 pom 里的依赖 + 改配置，<b>这个类的代码一行没动</b>。
+     *                   这就是"面向接口"最直观的一次实感</li>
      *   <li>留最近几条 → {@link MessageWindowChatMemory} 的 {@code maxMessages(N)}</li>
      *   <li>这是谁的   → {@link ChatMemory#CONVERSATION_ID}</li>
      *   <li>存哪些消息 → {@link MessageChatMemoryAdvisor}（一问一答自动存，连工具调用都成对存）</li>
@@ -120,12 +131,16 @@ public class AiAgentService {
      * 变的只有调用方式 —— 那边是 {@code .user(facts)}（给数据），
      * 这边是 {@code .tools(tools)}（给能力）。这是今天最值得记住的一句话。
      */
-    public AiAgentService(HmdpClient hmdpClient, ChatClient.Builder chatClientBuilder) {
+    public AiAgentService(HmdpClient hmdpClient,
+                          ChatClient.Builder chatClientBuilder,
+                          ChatMemoryRepository chatMemoryRepository) {
         this.hmdpClient = hmdpClient;
 
         // 只留最近 20 条。把这个数改成 2，就是下午那个"第 4 轮忘了名字"的实验。
+        // ★ chatMemoryRepository 是 Spring 注入进来的（现在是数据库版），
+        //   我们只负责在外面包一层"只留 20 条"的窗口。
         this.chatMemory = MessageWindowChatMemory.builder()
-                .chatMemoryRepository(new InMemoryChatMemoryRepository())
+                .chatMemoryRepository(chatMemoryRepository)
                 .maxMessages(20)
                 .build();
 
@@ -153,10 +168,11 @@ public class AiAgentService {
      * 每一轮都是一次真实的 HTTP 请求，都要花钱、花时间。
      * 返回里的 {@code elapsedMs} 和 {@code toolCalls.size()} 就是这笔账。
      */
-    public AgentResult chat(String question, String token, Long confirmVoucherId) {
+    public AgentResult chat(String question, String token, String conversationId, Long confirmVoucherId) {
 
         // 现在只要这一个 key 了 —— 取历史、存历史、裁剪窗口，全归 MessageChatMemoryAdvisor 管。
-        String key = (token != null) ? token : "anonymous";
+        // 三档优先级的来龙去脉见下面 resolveKey() 的注释。
+        String key = resolveKey(token, conversationId);
 
         // 每个请求 new 一个工具对象，这样 trace 里记录的就只会是这一次的调用
         HmdpTools tools = new HmdpTools(hmdpClient,token,confirmVoucherId);
@@ -180,17 +196,27 @@ public class AiAgentService {
         //   模型知道了 id 也只能"照对"，伪造不了。
         //
         // 三次改文字（工具描述、system prompt）都没能让它不猜 —— 这次不改文字，改数据。
-        String systemPrompt = SYSTEM_PROMPT;
-        if (confirmVoucherId != null) {
-            systemPrompt = SYSTEM_PROMPT
-                    + "\n\n【本次请求的附加信息】用户在页面上已经确认，要抢的是 voucherId="
-                    + confirmVoucherId + " 这张券。直接用它调用 seckillVoucher，不要自己另找 id。";
-        }
+        String systemPrompt = buildSystemPrompt(confirmVoucherId);
+
+        // ★ 开始记账 ★ —— 必须在调模型【之前】挂上账本，
+        // 这样框架在每一轮结束时回调 RoundUsageRecorder.onStop() 才有地方记。
+        // 挂晚了，第 1 轮的账就丢了。
+        RoundUsageRecorder.begin();
 
         long startedAt = System.currentTimeMillis();
-        String answer;
+        String answer = null;
+        Usage usage = null;
+        String failure = null;
         try {
-            answer = chatClient.prompt()
+            // ★★★ 注意这里从 .content() 换成了 .chatResponse() ★★★
+            //
+            // .content() 只把回答的文字掏给你，其余全扔了 —— 包括账本。
+            // .chatResponse() 把整个响应对象给你，里面有：
+            //   getResult().getOutput().getText()  → 回答文字（就是原来 .content() 给的那个）
+            //   getMetadata().getUsage()           → 这次请求的 token 账（【已经包含所有轮次】）
+            //
+            // 一句话：.content() 是"只要答案"，.chatResponse() 是"答案 + 它是怎么来的"。
+            ChatResponse response = chatClient.prompt()
                     .system(systemPrompt)
                     .user(question)
                     // 告诉 advisor：这次是【谁】的对话。
@@ -201,24 +227,46 @@ public class AiAgentService {
                     // 去掉它 = 一个普通的问答机器人：模型只能凭你给的字面信息回答
                     .tools(tools)
                     .call()
-                    .content();
+                    .chatResponse();
+
+            answer = response.getResult().getOutput().getText();
+            usage = response.getMetadata().getUsage();
         } catch (Exception e) {
             // 调模型失败的原因很多（key 没配、欠费、网络、限流），
             // 堆栈对人不友好，但一定要打全，不然没法排查。
             log.error("调用模型失败", e);
-            return new AgentResult(question,
-                    "调用模型失败了。最常见的原因是环境变量 DEEPSEEK_API_KEY 没设上 —— "
-                            + "去启动窗口看看堆栈里是不是有 'Your api key: ****KEY} is invalid'。"
-                            + "原始错误:" + e.getMessage(),
-                    tools.trace(),
-                    System.currentTimeMillis() - startedAt);
+            failure = "调用模型失败了。最常见的原因是环境变量 DEEPSEEK_API_KEY 没设上 —— "
+                    + "去启动窗口看看堆栈里是不是有 'Your api key: ****KEY} is invalid'。"
+                    + "原始错误:" + e.getMessage();
         }
+
+        // ★ 收账 ★ —— 成功失败都要走到这里，把账本从当前线程上摘下来。
+        List<RoundUsageRecorder.Round> rounds = RoundUsageRecorder.end();
 
         long elapsed = System.currentTimeMillis() - startedAt;
         List<String> calls = tools.trace();
+        TokenUsage total = TokenUsage.of(usage);
 
-        log.info("[Agent] 模型共调用 {} 次工具，耗时 {} ms", calls.size(), elapsed);
+        if (failure != null) {
+            // 失败也要把账带上：失败常常比成功更烧钱（模型重试、超时重发），
+            // 只记成功的账，这部分成本你就永远看不见。
+            log.info("[账本] 请求失败，但已经烧掉 {} 轮模型调用，{}", rounds.size(), total.describe());
+            return new AgentResult(question, failure, calls, elapsed, total, rounds);
+        }
+
+        // ── 这就是"仪表盘"在控制台里的样子 ──────────────────────────
+        log.info("[Agent] 模型共调用 {} 次工具，{} 轮模型请求，耗时 {} ms",
+                calls.size(), rounds.size(), elapsed);
         log.info("[Agent] 调用路径：{}", calls);
+        log.info("[账本] 本次请求总账：{}", total.describe());
+
+        // ★★ 下面这两行才是重点 ★★
+        // 逐轮打出来，你会看到 prompt 一轮比一轮大 ——
+        // 因为每一轮都要把【整个上下文重发一遍】。
+        // 只看总账是感受不到这件事的。
+        for (RoundUsageRecorder.Round round : rounds) {
+            log.info("[账本]   {}", round);
+        }
 
         // ★ 把模型的最终回答也打出来。
         // 不打这行的话，你只有浏览器里能看到回答 ——
@@ -226,32 +274,139 @@ public class AiAgentService {
         // 换行用 \n：回答是多行的，挤成一行没法读。
         log.info("[Agent] 模型回答：\n{}", answer);
 
-        return new AgentResult(question, answer, calls, elapsed);
+        return new AgentResult(question, answer, calls, elapsed, total, rounds);
+    }
+
+    /**
+     * ★ 流式版 ★ —— 和 {@link #chat} 做的是**同一件事**，只是把答案一格一格吐出去。
+     *
+     * <h1>和 chat() 的区别只有一行</h1>
+     * <pre>
+     *   chat()    .call()    .chatResponse()   → 一次给你整个 ChatResponse
+     *   chatStream().stream() .content()       → 给你一个 Flux&lt;String&gt;，一个词一个词地冒
+     * </pre>
+     * <b>工具、护栏、记忆、system prompt —— 全都没变，一行没动。</b>
+     * 变的只是"怎么把结果拿回来"。这一点值得记住：<b>流式是"取结果的方式"，不是另一种 Agent。</b>
+     *
+     * <h1>Flux 是什么</h1>
+     * 你可以先把它理解成"一个会陆续到货的 List"。
+     * {@code List} 是你拿到手的时候东西就齐了；{@code Flux} 是"先给你个凭据，东西随后一件件送来"。
+     * 这是响应式编程（Reactive）的基本概念，Java 里由 Reactor 这个库提供。
+     *
+     * <h1>⚠️ 这个版本【没有】账本，原因值得一看</h1>
+     * {@link RoundUsageRecorder} 是靠 {@code ThreadLocal} 记账的 —— 而它成立的前提是
+     * "整个流程跑在同一条线程上"（阻塞式 {@code .call()} 满足这个前提）。
+     * 流式走的是 Reactor 的线程调度，这个假设不一定还成立，所以这里**故意没有开账本** ——
+     * 宁可没有数，也不要一个错的数。
+     *
+     * <p>（如果你去看 {@code RoundUsageRecorder} 的类注释，会看到我当时就写了这个隐患。
+     * 现在它变成真的了 —— <b>写注释的时候多想一步，未来会省你一次排查</b>。）
+     */
+    public Flux<String> chatStream(String question, String token, String conversationId, Long confirmVoucherId) {
+
+        String key = resolveKey(token, conversationId);
+        HmdpTools tools = new HmdpTools(hmdpClient, token, confirmVoucherId);
+        String systemPrompt = buildSystemPrompt(confirmVoucherId);
+
+        log.info("[Agent/stream] ========== 收到问题（流式）：{}", question);
+
+        long startedAt = System.currentTimeMillis();
+
+        return chatClient.prompt()
+                .system(systemPrompt)
+                .user(question)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, key))
+                .tools(tools)
+                // ★★★ 唯一的区别就在这两个方法名上 ★★★
+                .stream()
+                .content()
+                // doFinally：流"结束"时（正常结束/出错/被取消）都会走这里。
+                // 用它来打日志 —— 因为流是异步的，方法体早返回了，
+                // 你不能像 chat() 那样在最后一行直接写 log。
+                .doFinally(signal -> log.info(
+                        "[Agent/stream] 流结束（{}），耗时 {} ms，工具调用：{}",
+                        signal, System.currentTimeMillis() - startedAt, tools.trace()));
+    }
+
+    /**
+     * 算出这次请求的记忆桶名（"这是哪段对话"）。
+     *
+     * <p>★ <b>桶名（这是哪段对话）和凭证（你是谁）是两件事</b>，以前被焊成了同一个（都是 token）。
+     * 后果有两个：
+     * <ul>
+     *   <li><b>产品缺陷</b>：同一个用户只能有一份对话，换个话题也得接着上一段聊</li>
+     *   <li><b>评测没法跑</b>：真 token 加上时间戳就 401，所以真 token 那条 case
+     *       的记忆永远串在一起，第二次跑模型直接背上一次的答案（实测过）</li>
+     * </ul>
+     *
+     * <p>三档，优先级从高到低：
+     * <ol>
+     *   <li>传了 {@code X-Conversation-Id} → 用它（评测脚本每次换个新桶）</li>
+     *   <li>没传，但有 token → 退回老行为（浏览器 / 前端一个字不用改）</li>
+     *   <li>都没有 → anonymous</li>
+     * </ol>
+     */
+    private String resolveKey(String token, String conversationId) {
+        if (conversationId != null && !conversationId.isBlank()) {
+            return conversationId;
+        }
+        return (token != null) ? token : "anonymous";
+    }
+
+    /**
+     * 拼 system prompt。
+     *
+     * <p>这里有一个来之不易的修复，见第 9 条笔记：
+     * 模型在工具调用之间会**反复猜券号**（实测猜过 0 / -1 / 2），改了三遍文字都没用。
+     * 真正的原因是<b>"工具返回的内容不进记忆"</b> —— 模型手上根本没有那个 id。
+     * 所以最后靠"把数据喂进它的上下文"解决，也就是下面这几行。
+     *
+     * <p>⚠️ 告诉它 id ≠ 给它授权：真正的门仍然是
+     * {@code HmdpTools} 里那句 {@code confirmVoucherId.equals(voucherId)}。
+     */
+    private String buildSystemPrompt(Long confirmVoucherId) {
+        if (confirmVoucherId == null) {
+            return SYSTEM_PROMPT;
+        }
+        return SYSTEM_PROMPT
+                + "\n\n【本次请求的附加信息】用户在页面上已经确认，要抢的是 voucherId="
+                + confirmVoucherId + " 这张券。直接用它调用 seckillVoucher，不要自己另找 id。";
     }
 
     /**
      * 返回给调用方的结果。
      *
-     * <p>{@code toolCalls} 和 {@code elapsedMs} 这两个字段是<b>给你看的，不是给用户看的</b>。
-     * 它们回答两个问题：
+     * <p>{@code toolCalls} / {@code elapsedMs} / {@code usage} / {@code rounds}
+     * 这几个字段是<b>给你看的，不是给用户看的</b>。它们回答四个问题：
      * <ul>
      *   <li>"模型到底想了什么？" —— 看 {@code toolCalls}，这是 Agent 的"脑回路"</li>
      *   <li>"Agent 比 Workflow 贵多少？" —— 看 {@code elapsedMs}，
      *       每多一次工具调用 = 多一轮模型请求</li>
+     *   <li>"这次烧了多少钱？" —— 看 {@code usage}（总账，框架累加好的）</li>
+     *   <li>"钱花在哪一轮了？" —— 看 {@code rounds}（逐轮明细，我们自己记的）</li>
      * </ul>
-     * 在真实项目里，这两个数字是要进监控面板的：调用次数异常上涨 = 模型在死循环，
-     * 耗时飙升 = 工具变慢了。**"能观测"是 Agent 能不能上生产的前提。**
+     * 在真实项目里，这几个数字是要进监控面板的：调用次数异常上涨 = 模型在死循环，
+     * 耗时飙升 = 工具变慢了，token 异常上涨 = 上下文被撑爆了。
+     * <b>"能观测"是 Agent 能不能上生产的前提。</b>
      *
-     * @param question   用户原问题
-     * @param answer     模型最终的答复
-     * @param toolCalls  模型这一轮依次调用了哪些工具（按顺序）
-     * @param elapsedMs  从头到尾花了多少毫秒
+     * @param question  用户原问题
+     * @param answer    模型最终的答复
+     * @param toolCalls 模型这一轮依次调用了哪些工具（按顺序）
+     * @param elapsedMs 从头到尾花了多少毫秒
+     * @param usage     整个请求的 token 总账 + 估算费用
+     * @param rounds    逐轮的 token 明细（第 1 轮、第 2 轮……）。
+     *                  <b>这个列表的长度 = 模型被调了几次</b>，
+     *                  正常情况应该等于 {@code toolCalls.size() + 1}
+     *                  （每次工具调用后要再问一轮，最后还有一轮出答案）；
+     *                  对不上就说明模型在一轮里并行了多个工具调用
      */
     public record AgentResult(
             String question,
             String answer,
             List<String> toolCalls,
-            long elapsedMs
+            long elapsedMs,
+            TokenUsage usage,
+            List<RoundUsageRecorder.Round> rounds
     ) {
     }
 }

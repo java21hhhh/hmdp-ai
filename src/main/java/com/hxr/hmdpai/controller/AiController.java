@@ -2,7 +2,9 @@ package com.hxr.hmdpai.controller;
 
 import com.hxr.hmdpai.service.AiAgentService;
 import com.hxr.hmdpai.service.AiRecommendService;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
 
 /**
  * 对外接口。跟 hmdp 里的 Controller 写法完全一样 —— 这正说明
@@ -68,7 +70,43 @@ public class AiController {
     @GetMapping("/agent")
     public AiAgentService.AgentResult agent(@RequestParam("question") String question,
     @RequestHeader(value = "authorization", required = false) String token ,
+    @RequestHeader(value = "X-Conversation-Id", required = false) String conversationId,
      @RequestParam(value = "confirm", required = false) Long confirmVoucherId) {
-        return aiAgentService.chat(question,token,confirmVoucherId);
+        return aiAgentService.chat(question,token,conversationId,confirmVoucherId);
+    }
+
+    /**
+     * ★ 流式版 Agent ★ —— 给【人】看的那道门。
+     *
+     * <h1>为什么不改上面那个 /agent，而是新开一个</h1>
+     * <ul>
+     *   <li>{@code /agent} 返回<b>一个完整的 JSON</b>。评测脚本用
+     *       {@code json.loads(读完整响应)} 解析它 —— 流式是一格一格吐的，
+     *       {@code json.loads} 会当场炸</li>
+     *   <li>流式的价值是<b>让人看着舒服</b>（字一个一个冒出来）；
+     *       JSON 的价值是<b>让程序好解析</b>。这两个目标本来就不一样</li>
+     * </ul>
+     * <b>结论：给机器用的接口别为了让新功能好看就改掉 —— 已经有东西在消费它了。</b>
+     * 真实的系统里，同一个能力对外提供两三种不同形态的接口非常常见。
+     *
+     * <h1>produces = text/event-stream 是什么意思</h1>
+     * 这是 SSE（Server-Sent Events）的 MIME 类型，浏览器专门认这个格式。
+     * 用 {@code EventSource} 一接就能拿到陆续送来的数据 ——
+     * <b>是服务器主动推，不是客户端反复问</b>。
+     * （对比你之前了解的轮询：轮询是"每分钟问一次有没有新消息"，
+     *   SSE 是"有新消息我直接推给你"。）
+     *
+     * <h1>怎么试</h1>
+     * <pre>
+     *   python3.12 C:\Users\HONOR\hmdp-ai-scripts\stream_check.py 火锅
+     * </pre>
+     * 别用浏览器直接开 —— 自定义头 {@code X-Api-Key} 浏览器地址栏发不了。
+     */
+    @GetMapping(value = "/agent/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> agentStream(@RequestParam("question") String question,
+                                    @RequestHeader(value = "authorization", required = false) String token,
+                                    @RequestHeader(value = "X-Conversation-Id", required = false) String conversationId,
+                                    @RequestParam(value = "confirm", required = false) Long confirmVoucherId) {
+        return aiAgentService.chatStream(question, token, conversationId, confirmVoucherId);
     }
 }
