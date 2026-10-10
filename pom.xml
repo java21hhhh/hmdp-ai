@@ -49,6 +49,19 @@
         </dependency>
 
         <!--
+          ★ 仪表盘依赖 ★
+          Spring AI 每次调模型都会发一份"观测数据"，但要有人接。
+          actuator 提供两样东西：
+            ① ObservationRegistry / MeterRegistry 两个 bean —— Spring AI 靠它们发数据
+            ② /actuator/metrics 这个 HTTP 端点 —— 让我们能在浏览器里看聚合指标
+          注意：micrometer 本身早就被 Spring AI 带进来了，这个依赖买的是"接线"和"端点"。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!--
           Spring AI 的 OpenAI 协议 starter。
           DeepSeek 提供 OpenAI 兼容端点,所以复用它 —— 靠 application.yml 里的
           base-url 把请求指向 api.deepseek.com 就行。
@@ -56,6 +69,51 @@
         <dependency>
             <groupId>org.springframework.ai</groupId>
             <artifactId>spring-ai-starter-model-openai</artifactId>
+        </dependency>
+
+        <!--
+          ★ 会话记忆改存数据库 ★
+          加上这个 starter，Spring AI 就会用 JDBC 版的 ChatMemoryRepository
+          顶掉默认的内存版 —— 我们 Java 代码里一行都不用改（见 AiAgentService 构造器）。
+          这是"面向接口"最直观的一次体现：换实现 = 换依赖。
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-model-chat-memory-repository-jdbc</artifactId>
+        </dependency>
+
+        <!--
+          一个嵌入式数据库。H2 不用单独安装、不用起服务，加个依赖就能用，
+          数据可以落在本地文件里（配置见 application.yml）。
+          版本由 spring-boot-starter-parent 统一管理，不用写。
+        -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+          ★ 可观测性第三根柱子：链路追踪（Traces）★
+          日志回答"发生了什么"，指标回答"总体怎么样"，链路回答"这一次慢在哪"。
+          前面两个已经有了（[账本] 日志 + actuator 仪表盘），这是最后一个。
+
+          为什么只加【一个】依赖就够了：
+          Spring Boot 4 把它打包成了 starter，一个顶三个 ——
+            · micrometer-tracing-bridge-brave   ← 把 Micrometer 的 Observation 翻译成 span
+            · zipkin-reporter-brave             ← 把 span 上报出去
+            · 两个自动配置模块                  ← 接线，让上面两个自己装配好
+
+          ★ 为什么一行 Java 代码都不用改 ★
+          因为 span 不是我们"写"出来的，是【框架本来就发的观察数据】。
+          Tomcat 收包、RestClient 发请求、Spring AI 调模型，各自早就在发 Observation，
+          之前只是没人接。加了这个依赖，等于给已经存在的信号接上了接收器。
+
+          ⚠️ 光加依赖不够，还要配采样率（见 application.yml）—— Boot 默认只采 10%。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-zipkin</artifactId>
         </dependency>
 
         <dependency>

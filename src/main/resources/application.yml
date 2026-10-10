@@ -5,6 +5,18 @@ spring:
   application:
     name: hmdp-ai
 
+  # ★ 会话记忆改存数据库（配套改动见 pom 和 AiAgentService）★
+  #
+  # H2 的【文件模式】：H2 是嵌入式数据库，不用单独安装。
+  #   jdbc:h2:file:./data/...   → 数据落到磁盘上的这个文件里，重启不丢
+  #   jdbc:h2:mem:...           → 又变回"重启就没"（想对比的话可以改来试试）
+  # AUTO_SERVER=TRUE 允许多个进程同时连它（方便用工具连进去看表里到底存了什么）。
+  datasource:
+    url: jdbc:h2:file:./data/hmdp-ai-memory;AUTO_SERVER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
   ai:
     openai:
       # DeepSeek 的 OpenAI 兼容端点。
@@ -29,6 +41,19 @@ spring:
           # 想让它更稳定可复现,调低到 0.2~0.3 试试 —— 这是你自己可以玩的旋钮。
           temperature: 0.7
 
+    # ★ 记忆的存储方式 ★
+    # classpath 上只要有 spring-ai-starter-model-chat-memory-repository-jdbc，
+    # Spring AI 就会拿 JDBC 版的 ChatMemoryRepository 顶掉内存版 ——
+    # 代码里那行 new InMemoryChatMemoryRepository() 就是被它替换掉的。
+    chat:
+      memory:
+        repository:
+          jdbc:
+            # always = 每次启动都跑一遍建表脚本。
+            # 脚本本身是 CREATE TABLE IF NOT EXISTS，重复执行很安全。
+            # 学习项目图省事；生产上通常用 never，表结构交给迁移工具（Flyway 之类）管。
+            initialize-schema: always
+
 # 我们要调用的 hmdp 后端地址(它跑在 8081,nginx 是 8080,别搞混)
 hmdp:
   base-url: http://localhost:8081
@@ -46,6 +71,68 @@ hmdp-ai:
   #    宁可起不来,也不要"以为保护了、其实裸奔"。
   api-key: ${HMDP_AI_API_KEY:}
 
+# ★ 仪表盘端点 ★
+#
+# actuator 默认【只】暴露 /actuator/health,其它端点要自己报名单。
+# 这里只开 metrics(指标) 和 health(健康),不开 beans / env / heapdump ——
+# 那几个能把环境变量、内存快照暴露出去,本地玩玩可以,养成习惯就危险了。
+#
+# ⚠️ 注意:你写的 ApiKeyFilter 是拦【所有】URL 的,所以 /actuator/** 也要带 X-Api-Key 才能访问。
+#    这不是 bug,是对的 —— 见上面那句"养成习惯"。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: metrics,health
+
+  # ★ 可观测性第三根柱子：链路追踪（Traces）★
+  # 配套改动见 pom.xml（加了一个 spring-boot-starter-zipkin）。Java 代码一行没动。
+  #
+  # 三根柱子各回答一个问题：
+  #   日志 [账本]      → 刚才发生了什么
+  #   指标 /metrics    → 一共烧了多少、整体趋势
+  #   链路 Zipkin      → 【这一次】的 19 秒，花在哪了   ← 就是这个
+  tracing:
+    sampling:
+      # ⚠️ 这一行【必须写】。Boot 的默认值是 0.1 —— 只采 10%。
+      #
+      # 不写会怎样：十次请求里只有一两次有链路，你会以为是接错了，
+      #           然后回头怀疑依赖、怀疑配置 —— 其实只是没抽中。
+      # "采样"就是随机抽百分之几的请求详细记账，没抽中的不留痕。
+      # 这是为了控存储（生产上 QPS 一高，链路一天能扫出上百 GB）。
+      # 本地开发就你一台机器，直接全采，别给自己制造谜题。
+      #
+      # 反面代价也要记住：抽样意味着【出问题的那次可能刚好没被抽中】，
+      # 所以大厂会用"尾部采样"（先收着，结束时发现报错的留下）。那是后话。
+      probability: 1.0
+
+    export:
+      zipkin:
+        # 上报地址。下面这个值<b>就是默认值</b>，本地跑 Zipkin 不用写。
+        # 留成注释是让你知道有这个旋钮：Zipkin 装到别的机器上时改这里。
+        #
+        # ⚠️ 老教程（Boot 3 时代）写的是 management.zipkin.tracing.endpoint，
+        #    那个名字在 Boot 4 里已废弃，而且废弃级别是 error ——
+        #    写上去不是打个警告，是【直接启动失败】。
+        #    真名是 management.tracing.export.zipkin.endpoint（我从 jar 里的
+        #    spring-configuration-metadata.json 挖出来的，不是猜的）。
+        # endpoint: http://localhost:9411/api/v2/spans
+
 logging:
   level:
     com.hxr.hmdpai: DEBUG
+
+  # ★ 把链路 id 塞进每一行日志 ★ —— "三根柱子拧成一股"就靠这一行
+  #
+  # 加了之后日志行会变成：
+  #   INFO [hmdp-ai,4bf92f3577b34da6a3ce929d0e0e4736,a1b2c3d4e5f60718] [账本] ...
+  #                └── 应用名 ──┘└──────── traceId ────────┘└── spanId ──┘
+  #
+  # 于是在 Zipkin 页面点那根 14 秒的红条，就能顺着 traceId 找到它当时打的日志。
+  # 横向看树（Zipkin）、纵向看细节（日志），这才是"可观测"的意思。
+  #
+  # traceId / spanId 这两个名字不是你起的，是 tracing 组件自动放进 MDC 的；
+  # %X{...:-} 里的 ":-" 是"取不到就留空"，免得没有链路时打印出 null。
+  # ⚠️ 整个值必须加引号 —— 因为它以 % 开头，YAML 会把它当成特殊记号。
+  pattern:
+    level: "%5p [${spring.application.name:},%X{traceId:-},%X{spanId:-}]"

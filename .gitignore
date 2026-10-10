@@ -20,6 +20,13 @@ target/
 *.log
 logs/
 
+### 本地数据库 ###
+# H2 的文件库（会话记忆就存在这儿，见 application.yml 的 spring.datasource.url）。
+# 里面是你和模型实际聊过的内容，属于【运行时数据】，不该进仓库 ——
+# 和 target/ 一个道理：是你机器上跑出来的产物，不是源码的一部分。
+# H2 会生成 hmdp-ai-memory.mv.db 和可能的 .trace.db，整个目录一起挡掉。
+data/
+
 ### 系统 ###
 .DS_Store
 Thumbs.db
@@ -33,3 +40,8 @@ run-local.bat
 application-local.yml
 application-local.yaml
 .env
+
+# 上面那个文件被改坏时留下的备份,里面同样是真 key。
+# 只写 启动.bat 挡不住 启动.bat.bak —— 通配一下。
+*.bak
+*~
