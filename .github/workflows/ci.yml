@@ -1,0 +1,92 @@
+# ════════════════════════════════════════════════════════════════════
+#  CI —— 每次 push 自动跑三件事
+# ════════════════════════════════════════════════════════════════════
+#
+#  ★ 先说清楚它【不】做什么 ★
+#
+#  它不跑评测（scripts/eval_agent.py）。原因有两个，都不是偷懒：
+#    ① 评测要真调 DeepSeek，每跑一次都是真金白银；
+#    ② 评测要 hmdp 后端 + hmdp-ai 都跑起来，还得有 DEEPSEEK_API_KEY、
+#       X-Api-Key，而 CI 里放密钥等于把密钥交给一个你控制不了的环境。
+#  所以评测是【人手动跑】的。CI 管的是另一件事：
+#
+#  ★ 它做的三件事，全都是"编译级"的检查 ★
+#
+#    1. Java 能不能编过（mvn compile）
+#    2. 脚本能不能过语法检查（py_compile）—— 只查语法，不执行、不发请求
+#    3. 仓库里有没有混进密钥文件
+#
+#  第 2 条不是凑数的：写这批脚本的时候真栽过一次 ——
+#  Python 的字符串里打了 ASCII 双引号，把一个中文字符串从中间截断了，
+#  整个文件当场语法错误。而这种错，py_compile 一秒就能抓到。
+#
+#  第 3 条是这个仓库的【铁律】：仓库里零密钥（见 README 和 .gitignore）。
+#  上一个项目就是因为密钥进了 git 才被迫洗历史，这道闸不能再靠自觉。
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ── 1. Java 编得过吗 ─────────────────────────────────────────────
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: 编译
+        # 只 compile，不 test —— 这个项目没有单元测试。
+        # （不写 test 装样子：一个跑 0 个测试的测试步骤，比没有更误导人。）
+        run: mvn -B -DskipTests compile
+
+  # ── 2. 脚本语法对不对 ───────────────────────────────────────────
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 语法检查 scripts/ 下所有脚本
+        # ★ 是 py_compile，不是 python xxx.py ★
+        #   py_compile 只把源码编译成字节码，【不导入、不执行】——
+        #   所以它既不会去连 localhost:8082，也不会去读凭证文件。
+        #   写错了会怎么炸？看上面注释里那次真实事故。
+        run: |
+          find scripts -name '*.py' -print0 | xargs -0 python -m py_compile
+
+  # ── 3. 有没有密钥混进仓库 ───────────────────────────────────────
+  no-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查被 git 跟踪的文件里有没有密钥
+        # 查的是【已经被 git 跟踪】的文件，不是工作区的文件 ——
+        # .gitignore 挡的是"还没提交"，这里挡的是"已经提交了"。
+        # 两者是两道不同的闸，缺一道都拦不住。
+        run: |
+          set -e
+          # 故意用 git ls-files：它列出的就是"已经在版本库里"的文件。
+          BAD=$(git ls-files | grep -Ei \
+            '(^|/)(apikey|token|login)\.(txt|json)$|(^|/)\.env$|application-local\.ya?ml$|^启动\.bat$|^run-local\.bat$|\.bak$' \
+            || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::仓库里混进了不该提交的密钥相关文件："
+            echo "$BAD"
+            echo "→ 见 .gitignore 末尾那段说明。光删掉文件不够，还要从历史里清掉。"
+            exit 1
+          fi
+          echo "✓ 没有发现被跟踪的密钥文件"
