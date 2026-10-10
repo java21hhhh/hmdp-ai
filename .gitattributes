@@ -1,0 +1,28 @@
+# =============================================================================
+#  换行符统一 —— 解决"Windows 上开发、Linux 上运行"的经典坑
+# =============================================================================
+#
+#  背景：这个仓库在你的 Windows 上开发，但 deploy/ 里的脚本和 Dockerfile
+#  是要拿到 Linux 服务器上跑的。而 Windows 的 Git 默认 core.autocrlf=true，
+#  签出（checkout）时会自作主张把 LF 换成 CRLF。
+#
+#  坏起来长这样 —— 在服务器上（或者直接在 Git Bash 里 bash ./smoke-test.sh）：
+#
+#      bash: smoke-test.sh: /usr/bin/env bash^M: bad interpreter: No such file or directory
+#                                           └─ 罪魁祸首就是这个 ^M（一个多余的 \r）
+#
+#  ★ 它最坑的地方：【不会】在 git status / git diff 里提示你。
+#    文件"看起来"一模一样，本地也跑得通（Git Bash 脾气好），
+#    只有到了 Linux 上一跑才炸 —— 而且报错信息完全不指向真正的原因。
+#
+#  下面的规则 = "这几个后缀，无论签出到哪台机器，一律用 LF"：
+#      text    按文本处理，签出/提交时做换行规范化
+#      eol=lf  签出时用 LF —— 这一条会压过 core.autocrlf 的默认行为
+#
+#  为什么只写这三类：Java 源码、YAML、Markdown 用哪种换行都无所谓，
+#  只有【要交给 Linux 执行/解析】的这几种才娇气。
+# =============================================================================
+
+*.sh          text eol=lf
+Dockerfile*   text eol=lf
+.env*         text eol=lf
