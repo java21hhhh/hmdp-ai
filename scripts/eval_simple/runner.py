@@ -84,19 +84,23 @@ def ask(question, token, conversation_id, confirm, timeout=300):
     # 把参数拼到 URL 后面。
     # 中文不能直接放进 URL，urlencode 会替我们做 percent-encode。
     params = {"question": question}
-    if confirm is not None:
-        params["confirm"] = confirm
     url = BASE + "/ai/agent?" + urllib.parse.urlencode(params)
 
     request = urllib.request.Request(url)
 
-    # 这三个头作用完全不同，别搞混：
+    # 这几个头作用完全不同，别搞混：
     if API_KEY:
         # ① 门卫的钥匙。不带它，请求根本进不了 Controller，直接 401。
         request.add_header("X-Api-Key", API_KEY)
     if token:
         # ② 你是谁（登录凭证）。只有下单那种写操作才需要。
         request.add_header("authorization", token)
+    if confirm is not None:
+        # ④ 用户"已确认"的信号（里面装的是券 id）。
+        #    ★ 它走请求头，不走 URL：URL 会进访问日志/浏览器历史/Referer。
+        #    ⚠️ 但它的原则没变 —— 仍然是【HTTP 参数】，
+        #       模型在工具参数里传什么都不算数。见 AiController 类注释。
+        request.add_header("X-Confirm-Voucher-Id", str(confirm))
     if conversation_id:
         # ③ 这是哪段对话（记忆的桶名）。
         #    ★ 以前 ② 和 ③ 是同一个 token，所以真 token 加不了时间戳（加了就 401）。

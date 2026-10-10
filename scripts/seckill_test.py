@@ -62,22 +62,22 @@ print()
 # 每步：(标题, 问题, confirm 参数)
 #   confirm=None  → 不带确认信号（模拟"用户还没点确认"）
 #   confirm=10    → 前端在用户点了确认之后加上的
+#   ★ 它发的时候走【请求头】X-Confirm-Voucher-Id，不走 URL
+#     （2026-10-10 从 ?confirm=10 挪过来的，理由见 AiController 类注释）
 STEPS = [
     ("第 1 轮：问券（不带确认信号）",
      "103茶餐厅有什么券？", None),
 
-    ("第 2 轮：确认（confirm=10）—— 看它这次报什么 id",
+    ("第 2 轮：确认（X-Confirm-Voucher-Id: 10）—— 看它这次报什么 id",
      "确认", 10),
 
-    ("第 3 轮：再确认一次（confirm=10）—— 拦下来的信息它用不用得上",
+    ("第 3 轮：再确认一次（X-Confirm-Voucher-Id: 10）—— 拦下来的信息它用不用得上",
      "确认", 10),
 ]
 
 
 def call(question, token, confirm, timeout=300):
     params = {"question": question}
-    if confirm is not None:
-        params["confirm"] = confirm
     url = BASE + "/ai/agent?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url)
     # 门卫那把钥匙：不过这一关，请求根本进不去 Controller
@@ -86,6 +86,9 @@ def call(question, token, confirm, timeout=300):
     # 用户凭证：只有下单（写操作）才用得上
     if token:
         req.add_header("authorization", token)
+    # ★ 确认信号：走请求头，不走 URL
+    if confirm is not None:
+        req.add_header("X-Confirm-Voucher-Id", str(confirm))
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 

@@ -84,7 +84,7 @@ PYTHONIOENCODING=utf-8 python3.12 seckill_test.py
 # 也可以自己传一个 token：python3.12 seckill_test.py <token>
 ```
 
-三轮：先问券（不带确认信号）→ 再确认（`confirm=10`）→ 又确认一次。
+三轮：先问券（不带确认信号）→ 再确认（请求头 `X-Confirm-Voucher-Id: 10`）→ 又确认一次。
 看的是它第 2、3 轮分别报什么 id、拦下来的信息它用不用得上。
 
 ### `eval_agent.py` —— 打分

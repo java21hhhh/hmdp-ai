@@ -95,8 +95,10 @@ hmdp-ai   :8082   Spring Boot 4.1  （jakarta.*）—— 这个仓库
 所以我没有靠 prompt 里写"请不要擅自下单"（那是**请求**，不是**约束**），而是在代码里装了两道门：
 
 **第一道 · 确认门**（`HmdpTools.java`）
-`seckillVoucher` 要拿到一个 `confirmVoucherId`，而这个值**只能来自 HTTP 参数**，
-**模型在工具参数里传什么一律不算数**：
+`seckillVoucher` 要拿到一个 `confirmVoucherId`，而这个值**只能来自请求头
+`X-Confirm-Voucher-Id`**（最初走的是 URL 上的 `?confirm=`，后来挪进了请求头 ——
+URL 会进访问日志 / 浏览器历史 / `Referer`，而"某个动作已被授权"这种信息不该留在 URL 上；
+理由见 `AiController` 类注释）。**模型在工具参数里传什么一律不算数**：
 
 ```java
 if (confirmVoucherId == null || !confirmVoucherId.equals(voucherId)) {
@@ -104,8 +106,8 @@ if (confirmVoucherId == null || !confirmVoucherId.equals(voucherId)) {
 }
 ```
 
-用户嘴上说"帮我买"，模型真去调了，也照样被拦——因为**门认的是 URL 上的 `confirm=`，
-不认模型的判断**。这一条是整个项目的核心：
+用户嘴上说"帮我买"，模型真去调了，也照样被拦——因为**门认的是请求头里那个值，
+不认模型的判断**（换了位置，没换原则）。这一条是整个项目的核心：
 
 > **凡是你不能交给模型的东西，就别让它在模型手里。**
 > token 是这样，确认是这样，API Key 也是这样（所以它们全在 HTTP 头里，不在工具参数里）。
@@ -121,6 +123,11 @@ if (confirmVoucherId == null || !confirmVoucherId.equals(voucherId)) {
 上次聊的内容还在。而且**对话是按 `X-Conversation-Id` 分桶的** ——
 "谁在说话"（`authorization`）和"这是哪段对话"（`X-Conversation-Id`）是两个东西，
 拆开之后，同一个用户的不同会话不会串味。
+
+> **开发用 H2，生产可切。** Spring AI 的 `ChatMemoryRepository` 是**可替换实现** ——
+> 要换 MySQL / PostgreSQL，换的是这一个 Bean，业务代码一行不动。
+> H2 文件库解决的是「**开发期重启不丢**」这个问题，不是生产选型；
+> 生产该用哪个库，取决于你要不要多实例共享记忆、要不要独立备份。
 
 > 这块有个反直觉的坑，我实测过并写进了注释：**工具返回的内容不进记忆，
 > 但模型自己说过的话进记忆。** 于是上一轮的"答案"会变成这一轮的"事实" ——
@@ -227,6 +234,15 @@ PYTHONIOENCODING=utf-8 python3.12 eval_agent.py       # 5 条用例自动判分
 > → `~/hmdp-ai-secrets/`）。**仓库里一个密钥文件都没有。**
 > 每个脚本干嘛、密钥怎么放，见 **[`scripts/README.md`](scripts/README.md)**。
 
+### 评测是**人手动跑的**，CI 不跑它
+
+这不是没搭 CI —— CI 在 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)，
+但**它刻意不跑评测**。两个理由：评测要真调 DeepSeek（每次都是钱），
+而且要在 CI 里放 `DEEPSEEK_API_KEY` 和 `X-Api-Key`（那等于把密钥交给一个你管不了的环境）。
+
+所以分工是：**CI 管「编得过、语法没写错、没把密钥提交上去」，
+人管「行为对不对」。** 前者机器一秒能判，后者机器判不了 —— 硬塞给 CI 只会得到一个假绿。
+
 ---
 
 ## 目录结构
@@ -247,6 +263,7 @@ src/main/java/com/hxr/hmdpai/
 
 scripts/     体检工具集（评测 / 记忆 / 指标 / 流式 / 链路）
 deploy/      Docker 部署包（compose + 冒烟脚本 + 部署手册）
+.github/     CI：只做编译级检查（编得过 / 语法对 / 没混进密钥）
 ```
 
 ---

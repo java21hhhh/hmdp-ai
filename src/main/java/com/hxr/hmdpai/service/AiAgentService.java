@@ -190,7 +190,8 @@ public class AiAgentService {
         //   实测它猜过 0、-1、2，三次三个数，全都是编的。
         //
         // 为什么我们能直接告诉它？
-        //   因为这个 id 就在 URL 的 confirm 上，我们一直看得见。
+        //   因为这个 id 是【用户】在请求头 X-Confirm-Voucher-Id 里带过来的，我们一直看得见。
+        //   （2026-10-10 之前它走 URL 上的 ?confirm=，挪进请求头不影响这里 —— 挪的是位置，不是信息本身。）
         //   ⚠️ 注意：告诉它 id ≠ 给它授权。真正的授权仍然是
         //   HmdpTools 里那道门（confirmVoucherId.equals(voucherId)），
         //   模型知道了 id 也只能"照对"，伪造不了。

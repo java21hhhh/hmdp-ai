@@ -20,6 +20,28 @@ import reactor.core.publisher.Flux;
  * 还有 {@code factsSentToModel} —— 那是发给模型的原始数据。
  * <b>一定要点开看一眼</b>,这是理解 AI 应用最直接的方式:
  * 你会立刻明白"模型的输出质量取决于你喂进去的上下文"这句话是什么意思。
+ *
+ * <h1>三个请求头，各管一件事</h1>
+ * <ul>
+ *   <li>{@code X-Api-Key} —— <b>门卫</b>。见 {@code ApiKeyFilter}，缺了直接 401，跟业务无关</li>
+ *   <li>{@code authorization} —— <b>用户身份</b>。用来给记忆分桶（谁在说话），
+ *       查询类接口不校验它</li>
+ *   <li>{@code X-Conversation-Id} —— <b>会话标识</b>。同一用户的不同对话靠它隔离</li>
+ *   <li>{@code X-Confirm-Voucher-Id} —— <b>确认信号</b>。就是「两道门」里的确认门，
+ *       详见下面那条 ★ 说明</li>
+ * </ul>
+ *
+ * <h1>★ 为什么确认信号是【请求头】，而不是 URL 上的 {@code ?confirm=10} ★</h1>
+ * 这个东西一开始是走 query 参数的，后来挪到了请求头。两个理由：
+ * <ol>
+ *   <li><b>会进日志</b>。URL 会被访问日志、浏览器历史、{@code Referer} 原样记下来；
+ *       请求头不会。凡是表达"某个动作已被授权"的东西，都不该留在 URL 上 ——
+ *       这是 HTTP 语义里的常识（GET 应当安全、幂等），也是很多安全扫描器的检查项</li>
+ *   <li><b>语义更对</b>。它不是"要查什么"（那是 {@code question}），
+ *       而是"这次请求带着什么凭证" —— 那本来就是请求头该干的事</li>
+ * </ol>
+ * <b>注意原则没变：它仍然只能来自 HTTP 参数，模型在工具参数里传什么都不算数。</b>
+ * 换的只是"从哪个 HTTP 位置读"，不是"要不要信模型"。
  */
 @RestController
 @RequestMapping("/ai")
@@ -71,7 +93,7 @@ public class AiController {
     public AiAgentService.AgentResult agent(@RequestParam("question") String question,
     @RequestHeader(value = "authorization", required = false) String token ,
     @RequestHeader(value = "X-Conversation-Id", required = false) String conversationId,
-     @RequestParam(value = "confirm", required = false) Long confirmVoucherId) {
+     @RequestHeader(value = "X-Confirm-Voucher-Id", required = false) Long confirmVoucherId) {
         return aiAgentService.chat(question,token,conversationId,confirmVoucherId);
     }
 
@@ -107,7 +129,7 @@ public class AiController {
     public Flux<String> agentStream(@RequestParam("question") String question,
                                     @RequestHeader(value = "authorization", required = false) String token,
                                     @RequestHeader(value = "X-Conversation-Id", required = false) String conversationId,
-                                    @RequestParam(value = "confirm", required = false) Long confirmVoucherId) {
+                                    @RequestHeader(value = "X-Confirm-Voucher-Id", required = false) Long confirmVoucherId) {
         return aiAgentService.chatStream(question, token, conversationId, confirmVoucherId);
     }
 }

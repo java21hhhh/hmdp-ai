@@ -93,7 +93,8 @@ public class HmdpTools {
     private final String token;
 
     /**
-     * ★ 硬确认门 ★ 本次请求带过来的"用户已确认"信号 —— 就是 URL 上的 {@code confirm=10}。
+     * ★ 硬确认门 ★ 本次请求带过来的"用户已确认"信号 —— 就是请求头
+     * {@code X-Confirm-Voucher-Id: 10}（以前走 URL 上的 {@code ?confirm=10}，2026-10-10 挪到了请求头）。
      *
      * <p><b>它可以是 null</b>，那就代表"用户还没点确认"。所以用它之前必须先判空。
      * （别写成 {@code confirmVoucherId.toString()} —— null 会当场炸，而 null 正是这道门最常见的样子。）
@@ -355,7 +356,8 @@ public class HmdpTools {
             Long voucherId) {
 
         // ★ 第一道：硬确认门 ——「你有权做这件事吗？」
-        //   confirmVoucherId 是【用户】在 URL 上带过来的，模型看不见、更编不出来。
+        //   confirmVoucherId 是【用户】在请求头 X-Confirm-Voucher-Id 里带过来的，
+        //   模型看不见、更编不出来。
         //   两个都要判：① null = 用户压根没确认   ② 对不上 = 用户确认的是别的券
         if (confirmVoucherId == null || !confirmVoucherId.equals(voucherId)) {
             log.warn("[工具] 确认门拦截：模型报 voucherId={}，用户确认的是 confirm={}",
