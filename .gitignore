@@ -45,3 +45,16 @@ application-local.yaml
 # 只写 启动.bat 挡不住 启动.bat.bak —— 通配一下。
 *.bak
 *~
+
+### scripts/ 的杂物 + 最后一道闸 ###
+# Python 跑一次就会生成 __pycache__，是编译缓存不是源码。
+__pycache__/
+*.py[cod]
+
+# ★ 兜底 ★ 脚本【默认不在这里读密钥】—— 它去 ~/hmdp-ai-secrets/ 找
+# （见 scripts/eval_simple/runner.py 的 read_secret）。仓库里本来就一个
+# 密钥文件都没有。写这三行只是防"哪天图省事顺手丢进来一个"：
+# 那道 .gitignore 是唯一的防线，而单靠一道防线的东西，迟早会失守在这里。
+apikey.txt
+token.txt
+login.json
