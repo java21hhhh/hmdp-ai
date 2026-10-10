@@ -1,0 +1,23 @@
+# 构建上下文 = 这个 deploy 目录。下面这些别塞进镜像里。
+#
+# ★ 最关键的是 .env —— 它装着 DEEPSEEK_API_KEY 和数据库密码。
+#   如果不挡掉，docker build 时会把它打进镜像层。
+#   镜像会被推到仓库、会被别人 pull，等于把 key 印在传单上发出去。
+#   （镜像是分层的，"删掉文件"并不会把那一层里的内容删掉。）
+.env
+.env.local
+
+# 这些是给人看的，不是给容器跑的
+README.md
+*.md
+
+# v1 的备份文件里可能有真 key
+*.bak
+*~
+
+# 数据库初始化脚本由 mysql 容器自己挂载（见 docker-compose.yml），
+# 两个应用镜像都用不到它。
+mysql-init/
+
+# 空的占位文件，不需要进镜像
+jars/.gitkeep

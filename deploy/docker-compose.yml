@@ -1,0 +1,260 @@
+# =============================================================================
+#  hmdp-ai 一键部署编排
+# =============================================================================
+#
+#  这一个文件把 5 个东西拉起来，并规定它们之间怎么互相找到对方：
+#
+#      ┌─────────────────────────── 宿主机 ───────────────────────────┐
+#      │                                                              │
+#      │   公网 :8082                        127.0.0.1:9411（只本机）  │
+#      │      │                                     │                 │
+#      │  ┌───┴────────┐   ┌────────┐   ┌───────┐  ┌┴──────┐          │
+#      │  │  hmdp-ai   │──▶│  hmdp  │──▶│ mysql │  │zipkin │          │
+#      │  │   :8082    │   │ :8081  │   │ :3306 │  │ :9411 │          │
+#      │  └────────────┘   └───┬────┘   └───────┘  └───────┘          │
+#      │                       │                                      │
+#      │                       └──▶ redis :6379                       │
+#      │                                                              │
+#      │  ← 所有容器在同一个私有网络 hmdp-net 里，用【服务名】互相访问 →
+#      └──────────────────────────────────────────────────────────────┘
+#
+#  ★ 两个刻意的设计，写简历时可以讲：
+#
+#    1. hmdp（8081）【不映射到宿主机】。
+#       它没有鉴权，还带着秒杀下单接口。让它只在容器网络里活着、
+#       只被 hmdp-ai 调用，外面根本连不到 —— 这就是"最小暴露面"。
+#
+#    2. zipkin（9411）【只绑 127.0.0.1】。
+#       链路里带着每次调用的参数和耗时，等于一份内部流水账，
+#       不该裸奔在公网。要看得先 SSH 隧道进来（命令见 README）。
+#
+#  用法：cp .env.example .env → 填真值 → docker compose up -d --build
+# =============================================================================
+
+# 日志轮转：默认 docker 会把容器日志无限写下去，几个月能把磁盘吃满。
+# 这套设置 = 每个服务最多留 3 个 10MB 的文件。生产上的标配，本地也该有。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# =============================================================================
+#  ★★ 内存上限（mem_limit）—— 每个服务都必须写 ★★
+# =============================================================================
+#
+#  为什么非写不可：
+#    Dockerfile 里给 JVM 的参数是 -XX:MaxRAMPercentage=70，意思是"最多用
+#    【容器内存】的 70% 当堆"。但"容器内存"这个数，只有在容器【真的被设了上限】
+#    时才存在 —— 不写 mem_limit，JVM 就退回去读【整机内存】。
+#
+#    这台机器 4G，于是每个 JVM 都以为自己的额度是 4G、都以为自己能长到 2.8G。
+#    两个 Java 进程外加 MySQL 一起往外长，机器直接 OOM。
+#    症状很难认：不是"报错"，是【容器莫名其妙就没了】(exit code 137)。
+#
+#  写了 mem_limit 之后：
+#    ① JVM 按【容器】的额度算堆（hmdp-ai 限 1024m → 堆 ≈ 716m）
+#    ② 谁超了只杀谁，不会把整机拖死
+#    ③ memswap_limit 和 mem_limit 写成一样的值 = 禁用 swap。
+#       不这么写，容器能拿 swap 续命，机器进入"疯狂换页"——
+#       表现就是 SSH 卡住、网页转圈。宁可直接被 OOM 杀掉一个容器，
+#       也别让整台机器变成一坨。
+#
+#  4G 机器的预算分配（加起来 3.2G，留约 800M 给系统和 dockerd）：
+#      hmdp-ai 1024m │ hmdp 768m │ mysql 768m │ zipkin 512m │ redis 192m
+#
+#  ★ 下面每个 mem_limit 都写成 ${MEM_XXX:-默认值}，所以【换机器不用改这个文件】：
+#      买 2核4G → 什么都不用填（默认值就是给 4G 配的）
+#      买 2核2G → 去 .env 里把那一组 4 行取消注释，值自动变小
+#    格式 ${VAR:-fallback} 读作"有 VAR 就用 VAR，没有就用 fallback" ——
+#    所以【不填也能跑】，填了才覆盖。
+#
+#  ★ zipkin 放在 "trace" 这个 profile 里，由 .env 的 COMPOSE_PROFILES 决定起不起。
+#    2核2G 带不动它（光它自己约 350M），把它关掉就行 —— 不用改这个文件。
+# =============================================================================
+
+name: hmdp-ai
+
+services:
+
+  # ---------------------------------------------------------------- MySQL ---
+  mysql:
+    image: mysql:8.0
+    container_name: hmdp-mysql
+    restart: unless-stopped
+    mem_limit: "${MEM_MYSQL:-768m}"
+    memswap_limit: "${MEM_MYSQL:-768m}"   # 与 mem_limit 相等 = 禁用 swap（见文件头说明）
+    command:
+      # 建库由下面 MYSQL_DATABASE 负责 ——
+      # ⚠️ 注意 hmdp.sql 里【没有】CREATE DATABASE 语句（我确认过），
+      #    所以这个变量不是可选项，少了它初始化脚本会直接报 "No database selected"。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      # 老驱动（hmdp 用的 mysql-connector 8.0.30）连 8.0 的默认加密插件偶发握手失败。
+      # 打开旧的认证方式，一次避开。
+      - --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: hmdp
+      TZ: Asia/Shanghai
+    volumes:
+      # 数据落在【命名卷】里，不在容器里。所以 docker compose down 之后再 up，
+      # 数据还在；只有 down -v 才会真删。
+      - mysql-data:/var/lib/mysql
+      # 这个目录里的 .sql 会在【第一次】启动、且数据目录还是空的时候被自动执行。
+      # 换句话说：改完 SQL 想重跑，必须先 down -v 把旧卷删掉。
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 为什么要 healthcheck：下面 hmdp 用 service_healthy 等它，
+      # 这样 Spring Boot 启动时数据库【真的能连】了，而不是"容器起来了但 mysqld 还在初始化"。
+      # 少了这个，hmdp 会在启动时连接被拒 —— 这是最常见的翻车点。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s        # 首次要初始化数据目录，给足 40 秒
+    logging: *default-logging
+    networks: [hmdp-net]
+
+  # ---------------------------------------------------------------- Redis ---
+  redis:
+    image: redis:7-alpine
+    container_name: hmdp-redis
+    restart: unless-stopped
+    mem_limit: "${MEM_REDIS:-192m}"
+    memswap_limit: "${MEM_REDIS:-192m}"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    environment:
+      TZ: Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    logging: *default-logging
+    networks: [hmdp-net]
+    # ★ 没设密码。因为它【不对外暴露端口】，只有同网络的容器能连。
+    #   真上线到公网环境，请补上 requirepass 并把密码传给 hmdp。
+
+  # ----------------------------------------------------------------- hmdp ---
+  # 黑马点评后端（Spring Boot 2.7.4）。被 hmdp-ai 当"业务系统"调用。
+  hmdp:
+    build:
+      context: .
+      dockerfile: Dockerfile.hmdp
+    image: hmdp:local
+    container_name: hmdp-backend
+    restart: unless-stopped
+    # 768m × 70% ≈ 堆 537m。Boot 2.7.4 + MyBatis + Redisson 这个量级够用。
+    mem_limit: "${MEM_HMDP:-768m}"
+    memswap_limit: "${MEM_HMDP:-768m}"
+    depends_on:
+      mysql:
+        condition: service_healthy     # ← 等数据库真能连了再起
+      redis:
+        condition: service_healthy
+    environment:
+      # 环境变量覆盖 application.yml 里的值（Spring Boot 的 relaxed binding）：
+      #   spring.datasource.url  → SPRING_DATASOURCE_URL
+      #   spring.redis.host      → SPRING_REDIS_HOST
+      #   （⚠️ Boot 2 里是 spring.redis.*；Boot 3+ 改名叫 spring.data.redis.*，
+      #     照 Boot 3 的写法在这会静默不生效，服务去连 127.0.0.1 然后超时。）
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/hmdp?useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&characterEncoding=utf8"
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: "6379"
+      TZ: Asia/Shanghai
+    # ★★ 故意【不写 ports】★★
+    # 8081 只活在 hmdp-net 这个私有网络里。宿主机连不到，公网更连不到。
+    # hmdp-ai 用 http://hmdp:8081 找它 —— "hmdp" 是服务名，Docker 内置 DNS 自动解析。
+    logging: *default-logging
+    networks: [hmdp-net]
+
+  # -------------------------------------------------------------- hmdp-ai ---
+  # 我这个 AI 服务（Spring Boot 4.1 + Spring AI 2.0）。唯一对公网开口的服务。
+  hmdp-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile.hmdp-ai
+    image: hmdp-ai:local
+    container_name: hmdp-ai
+    restart: unless-stopped
+    # 1024m × 70% ≈ 堆 716m。它是 5 个容器里最重的（Boot 4 + Spring AI + H2 文件库），
+    # 也是唯一对外开门的，别给它抠内存 —— 它挂了整个演示就没了。
+    mem_limit: "${MEM_HMDP_AI:-1024m}"
+    memswap_limit: "${MEM_HMDP_AI:-1024m}"
+    depends_on:
+      hmdp:
+        condition: service_started
+    ports:
+      # 左边是宿主机端口（.env 里可改，被占用了就换一个），右边是容器内固定 8082。
+      - "${PUBLIC_PORT:-8082}:8082"
+    environment:
+      # → hmdp.base-url
+      HMDP_BASE_URL: http://hmdp:8081
+      # → spring.ai.openai.api-key（没有默认值，缺了启动就炸）
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      # → hmdp-ai.api-key，请求头 X-Api-Key 要比对它。
+      #   ⚠️ 故意留了 ${VAR:?} 的"必须填"写法：忘了填 compose 直接报错，
+      #      而不是起一个"以为有保护、其实空字符串"的服务。
+      HMDP_AI_API_KEY: ${HMDP_AI_API_KEY:?HMDP_AI_API_KEY is required in .env}
+      # → management.tracing.export.zipkin.endpoint
+      #   默认值是 http://localhost:9411，在容器里那是【它自己】，没人监听 → 链路全丢。
+      #   必须改成服务名 zipkin，走 Docker 内网。
+      MANAGEMENT_TRACING_EXPORT_ZIPKIN_ENDPOINT: http://zipkin:9411/api/v2/spans
+      # 让 JVM 按【容器内存上限】自己算堆大小，不写死 -Xmx。
+      # 4G 的机器上，两个 Java 进程硬写 -Xmx1g 很容易互相挤爆。
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=70 -Duser.timezone=Asia/Shanghai"
+      TZ: Asia/Shanghai
+    volumes:
+      # H2 文件库在 /app/data/hmdp-ai-memory.mv.db（见 application.yml 的
+      # jdbc:h2:file:./data/...）。挂出来，重建容器时【对话记忆不会丢】。
+      - hmdp-ai-data:/app/data
+    logging: *default-logging
+    networks: [hmdp-net]
+
+  # ---------------------------------------------------------------- Zipkin ---
+  # 链路追踪的"仓库 + 界面"。今天刚接上的那套，在这里终于有地方收数据了。
+  zipkin:
+    image: openzipkin/zipkin:3
+    container_name: hmdp-zipkin
+    restart: unless-stopped
+    # ★ 挂在 "trace" profile 下：.env 里 COMPOSE_PROFILES 提到 trace 才会启动。
+    #   2核2G 的机器把它去掉即可（它自己约 350M，是 5 个里最不划算的那一份）。
+    profiles: ["trace"]
+    # 它的 Java 参数是写死的 -Xmx256m（见下面 JAVA_OPTS），不读容器额度。
+    # 512m 是给"堆之外"的部分留的：Metaspace + 线程栈 + 直接内存。
+    mem_limit: "${MEM_ZIPKIN:-512m}"
+    memswap_limit: "${MEM_ZIPKIN:-512m}"
+    environment:
+      STORAGE_TYPE: mem            # 存内存 —— 重启即清空。
+                                   # 目的只是"演示 + 截图"，不做长期留存。
+      JAVA_OPTS: "-Xms128m -Xmx256m"
+      TZ: Asia/Shanghai
+    ports:
+      # ★★ 只绑 127.0.0.1，不暴露到公网 ★★
+      # 链路数据 = 每次调用的详细流水，属于内部信息。
+      # 想在浏览器里看，用 SSH 隧道（README 里有现成命令，一行）。
+      - "127.0.0.1:${ZIPKIN_PORT:-9411}:9411"
+    logging: *default-logging
+    networks: [hmdp-net]
+
+# ---------------------------------------------------------------------------
+volumes:
+  # 显式起名，不靠"目录名"自动生成 —— 以后你把这个文件夹改名/挪位置，
+  # 卷名不会跟着变，数据不会"看起来丢了"。
+  mysql-data:
+    name: hmdp-mysql-data
+  redis-data:
+    name: hmdp-redis-data
+  hmdp-ai-data:
+    name: hmdp-ai-memory
+
+networks:
+  hmdp-net:
+    name: hmdp-net
+    driver: bridge

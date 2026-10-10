@@ -1,0 +1,52 @@
+# =============================================================================
+#  hmdp（黑马点评后端）运行镜像
+# =============================================================================
+#
+#  ★ 这个镜像里【只有 jar，没有 JDK、没有 Maven】。
+#    jar 是你在本地打好再拷进来的（见 README 第 2 步）。
+#
+#    为什么不把源码传上来在服务器上 mvn package？
+#      - 国内服务器从 Maven 中央仓库拉 Spring Boot 全家桶又慢又容易断；
+#      - 而你本地 ~/.m2 早就缓存好了，打包几十秒就完事；
+#      - 服务器只负责"跑"，不负责"编"，镜像也因此小得多、构建快得多。
+#    这也是实际项目里 CI（比如 GitHub Actions）打包、服务器只拉产物的做法。
+#
+#  ★ 为什么基镜像选 Java 17，而不是 8 或 21？
+#    hmdp 是 Spring Boot 2.7.4，官方支持 Java 8 ~ 19。
+#      选 8  → 太老，没必要的退化；
+#      选 21 → 超出它明确支持的版本，虽然你本机能跑，但上线要多担一份风险；
+#      选 17 → 落在支持区间内、又足够新。（源代码编译出的还是 Java 8 字节码，照样跑。）
+#
+#    ⚠️ 前提是你的 jar 确实是 Java 8 字节码。这个坑我们踩过一次：
+#       之前 target/classes 里混进了 Java 21 编的 class，Spring Boot 2.7.4 的 ASM
+#       读到就报 "Unsupported class file major version 65"。
+#       README 第 2 步里有一条命令专门验这个，别跳过。
+#
+#  ★ 万一：如果下面这个镜像跑 hmdp 时冒出奇怪的反射 / Unsafe / Netty 报错，
+#    把下一行换成 eclipse-temurin:8-jre 再构建一次。
+#    （hmdp 用的 redisson 3.13.6 是 2020 年的版本，设计上就是跑在 Java 8 上的。
+#      在这台机器上它跑在 JDK 21 下没问题，所以 17 基本也稳 —— 但真遇上了，
+#      换 8 是最快的解法，不用去改库版本。）
+# =============================================================================
+
+FROM eclipse-temurin:17-jre
+
+# 时区。不设的话容器里是 UTC，日志时间比北京时间少 8 小时 ——
+# 排查问题时对着日志算时差，纯属给自己添乱。
+ENV TZ=Asia/Shanghai
+
+WORKDIR /app
+
+# 构建上下文是 deploy/ 目录（见 docker-compose.yml 的 context: .）
+COPY jars/hmdp.jar /app/app.jar
+
+# 只是文档性的声明，告诉读的人这个容器打算监听 8081。
+# 注意：它【不会】把端口开放出去 —— compose 里没写 ports 就是没开放。
+EXPOSE 8081
+
+# MaxRAMPercentage 而不是写死 -Xmx512m：
+# 容器内存上限一变，JVM 自己按比例跟着变，不用回头改配置。
+# 2核4G 的机器上同时跑两个 JVM，拍脑袋写死 -Xmx 最容易互相挤爆。
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=70 -Duser.timezone=Asia/Shanghai"
+
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]

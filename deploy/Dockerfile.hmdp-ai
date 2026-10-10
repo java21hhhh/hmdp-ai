@@ -1,0 +1,34 @@
+# =============================================================================
+#  hmdp-ai（我的 AI 服务）运行镜像
+# =============================================================================
+#
+#  和 Dockerfile.hmdp 一个套路：本地打包，这里只负责跑。
+#  区别只有两点：
+#    1. 它要 Java 21（Spring Boot 4.1 的最低要求）；
+#    2. 它有个 H2 文件库要落在 /app/data，所以多建一个目录。
+#
+#  ⚠️ 这个服务【没有任何默认能跑起来的配置】：
+#       DEEPSEEK_API_KEY   缺了 → 启动即炸
+#       HMDP_AI_API_KEY    缺了 → 启动即炸（ApiKeyFilter 的构造器故意的）
+#       HMDP_BASE_URL      缺了 → 默认 localhost:8081，在容器里是它自己，调不通
+#     这三个都由 docker-compose.yml 从 .env 传进来，别在这里写死。
+# =============================================================================
+
+FROM eclipse-temurin:21-jre
+
+ENV TZ=Asia/Shanghai
+
+WORKDIR /app
+
+# H2 文件库会写到 ./data/ 下（相对工作目录，也就是 /app）。
+# 先建好并交给非 root 也没事 —— 这里图省事就用默认用户，
+# compose 里把命名卷挂到 /app/data，数据就落在卷上而不是容器层里。
+RUN mkdir -p /app/data
+
+COPY jars/hmdp-ai.jar /app/app.jar
+
+EXPOSE 8082
+
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=70 -Duser.timezone=Asia/Shanghai"
+
+ENTRYPOINT ["java", "-jar", "/app/app.jar"]
