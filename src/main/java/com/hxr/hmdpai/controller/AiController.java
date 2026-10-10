@@ -98,7 +98,8 @@ public class AiController {
      *
      * <h1>怎么试</h1>
      * <pre>
-     *   python3.12 C:\Users\HONOR\hmdp-ai-scripts\stream_check.py 火锅
+     *   cd scripts
+     *   python3.12 stream_check.py 火锅
      * </pre>
      * 别用浏览器直接开 —— 自定义头 {@code X-Api-Key} 浏览器地址栏发不了。
      */
